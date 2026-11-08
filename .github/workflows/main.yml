@@ -41,7 +41,6 @@ jobs:
           $password = "MR.English2008"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Never try to remove – just create if missing, reset password if exists
           $u = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
           if (-not $u) {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
@@ -51,8 +50,6 @@ jobs:
 
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          # Force enable (in case account was disabled)
           Enable-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
 
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
@@ -102,11 +99,9 @@ jobs:
           Write-Host "================================"
           Write-Host ""
 
-          # ---------- Gofile settings ----------
-          # Put your Gofile account token in secret GOFILE_TOKEN
-          # (get it from https://gofile.io/myProfile → API token)
-          $token   = "${{ secrets.GOFILE_TOKEN }}"
-          $folderId = "${{ secrets.GOFILE_FOLDER_ID }}"   # optional: fixed folder, leave empty for root
+          # Gofile token + optional folder (both can be empty)
+          $token    = "${{ secrets.GOFILE_TOKEN }}"
+          $folderId = "${{ secrets.GOFILE_FOLDER_ID }}"
 
           $backupRoot = "C:\Users\RDP"
           $watchFolders = @(
@@ -115,7 +110,6 @@ jobs:
               "$backupRoot\Downloads"
           )
 
-          # State file so we remember the last contentId we uploaded
           $stateFile = "C:\gofile_state.txt"
           if (-not (Test-Path $stateFile)) { "" | Set-Content $stateFile }
 
@@ -123,20 +117,27 @@ jobs:
               try {
                   $r = Invoke-RestMethod -Uri "https://api.gofile.io/servers" -Method Get
                   return $r.data.servers[0].name
-              } catch { return "store1" }
+              } catch {
+                  return "store1"
+              }
           }
 
           function Upload-ToGofile {
               param([string]$zipPath)
 
+              if (-not $token) {
+                  Write-Host "GOFILE_TOKEN is empty - skipping upload"
+                  return $null
+              }
+
               $server = Get-GofileServer
               $uri = "https://$server.gofile.io/contents/uploadfile"
 
               $form = @{
-                  file = Get-Item -Path $zipPath
+                  file  = Get-Item -Path $zipPath
+                  token = $token
               }
-              if ($token)   { $form["token"]    = $token }
-              if ($folderId){ $form["folderId"] = $folderId }
+              if ($folderId) { $form["folderId"] = $folderId }
 
               try {
                   $resp = Invoke-RestMethod -Uri $uri -Method Post -Form $form
@@ -169,9 +170,8 @@ jobs:
           function Do-Backup {
               $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
               $zip   = "C:\backup-$stamp.zip"
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Starting backup → $zip"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Starting backup -> $zip"
 
-              # Build zip of the three folders (only if they exist)
               $toZip = @()
               foreach ($f in $watchFolders) {
                   if (Test-Path $f) { $toZip += $f }
@@ -193,16 +193,14 @@ jobs:
 
               if ($data) {
                   Write-Host "Uploaded: $($data.downloadPage)  (id=$($data.fileId))"
-                  # Delete previous backup
                   $oldId = Get-Content $stateFile -ErrorAction SilentlyContinue
                   if ($oldId) { Delete-GofileContent -contentId $oldId }
-                  # Save new id
                   $data.fileId | Set-Content $stateFile
               }
           }
 
-          # ---------- Optional Downloads.bat helper ----------
-          $rdpProfile = "C:\Users\RDP"
+          # Optional Downloads.bat helper
+          $rdpProfile  = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
@@ -210,7 +208,9 @@ jobs:
           while ((Get-Date) -lt $deadline) {
               if (Test-Path $rdpProfile) {
                   try {
-                      if (-not (Test-Path $startupPath)) { New-Item -ItemType Directory -Path $startupPath -Force | Out-Null }
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
                       Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
                       cmd /c $downloadPath
                       break
@@ -219,24 +219,21 @@ jobs:
               Start-Sleep -Seconds 12
           }
 
-          # ---------- Main loop ----------
-          # First backup after ~2 hours, then every 2 hours.
-          # Final backup at ~1 h 55 min before the 6-hour mark (i.e. at minute 245).
+          # Main keep-alive + backup schedule
           $startTime     = Get-Date
           $nextBackup    = $startTime.AddHours(2)
-          $finalBackupAt = $startTime.AddMinutes(245)   # 4 h 05 min → leaves ~1 h 55 min
+          $finalBackupAt = $startTime.AddMinutes(245)
           $didFinal      = $false
 
           while ($true) {
               $now = Get-Date
-              Write-Host "[$($now.ToString('HH:mm:ss'))] RDP live – next backup $($nextBackup.ToString('HH:mm:ss'))"
+              Write-Host "[$($now.ToString('HH:mm:ss'))] RDP live - next backup $($nextBackup.ToString('HH:mm:ss'))"
 
               if ($now -ge $nextBackup) {
                   Do-Backup
                   $nextBackup = $now.AddHours(2)
               }
 
-              # Guaranteed last backup ~1 h 55 min before end
               if (-not $didFinal -and $now -ge $finalBackupAt) {
                   Write-Host "Final backup window reached"
                   Do-Backup

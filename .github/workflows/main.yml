@@ -12,58 +12,54 @@ jobs:
       - name: Configure Core RDP Settings (fast + stable)
         shell: powershell
         run: |
-          # Core enable
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # Performance / stability knobs
-          # KeepAlive so idle sessions don't drop
           Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveEnable" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveInterval" -Value 1 -Force   # minutes
-
-          # Disable wallpaper, animation, font smoothing for lower bandwidth / snappier feel
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableWallpaper" -Value 1 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableFullWindowDrag" -Value 1 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableMenuAnims" -Value 1 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableThemes" -Value 1 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxCompressionLevel" -Value 2 -Force -ErrorAction SilentlyContinue
-
-          # Larger receive window + disable UDP (TCP only is more stable on some CGNAT / GitHub runner networks)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveInterval" -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableUDP" -Value 1 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 0 -Force          # never idle-disconnect
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxDisconnectionTime" -Value 0 -Force
 
-          # Firewall: clean + allow
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $pol -Force | Out-Null
+          Set-ItemProperty -Path $pol -Name "fDisableWallpaper" -Value 1 -Force
+          Set-ItemProperty -Path $pol -Name "fDisableFullWindowDrag" -Value 1 -Force
+          Set-ItemProperty -Path $pol -Name "fDisableMenuAnims" -Value 1 -Force
+          Set-ItemProperty -Path $pol -Name "fDisableThemes" -Value 1 -Force
+
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=any
 
-          # Make sure TermService is running and set to auto
           Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User (new credentials)
+      - name: Create RDP User (old password)
         shell: powershell
         run: |
-          $password = "K9mP#vX2qR7nL4wZ"
+          $password = "MR.English2008"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "RDP" -Confirm:$false
+          # Never try to remove – just create if missing, reset password if exists
+          $u = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if (-not $u) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires $true
           }
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
 
-          # Also enable the built-in Administrator in case you prefer it later
-          net user Administrator /active:yes
+          # Force enable (in case account was disabled)
+          Enable-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
 
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          Write-Host "User RDP ready with password MR.English2008"
 
-          Write-Host "User RDP created with new password"
-
-      - name: Install Tailscale (pinned stable)
+      - name: Install Tailscale
         shell: powershell
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -84,10 +80,7 @@ jobs:
               if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') { break }
               Start-Sleep -Seconds 4
           }
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP never assigned"
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP never assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $tsIP"
 
@@ -95,13 +88,10 @@ jobs:
         shell: powershell
         run: |
           $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $r.TcpTestSucceeded) {
-              Write-Error "RDP port 3389 not reachable on Tailscale IP"
-              exit 1
-          }
+          if (-not $r.TcpTestSucceeded) { Write-Error "RDP port closed"; exit 1 }
           Write-Host "RDP TCP check OK"
 
-      - name: Print Access Info + Keep Alive
+      - name: Print Access + Background Gofile Backup Loop
         shell: powershell
         run: |
           Write-Host ""
@@ -112,33 +102,146 @@ jobs:
           Write-Host "================================"
           Write-Host ""
 
-          # Optional: drop a small startup helper if you still want the Downloads.bat behavior
+          # ---------- Gofile settings ----------
+          # Put your Gofile account token in secret GOFILE_TOKEN
+          # (get it from https://gofile.io/myProfile → API token)
+          $token   = "${{ secrets.GOFILE_TOKEN }}"
+          $folderId = "${{ secrets.GOFILE_FOLDER_ID }}"   # optional: fixed folder, leave empty for root
+
+          $backupRoot = "C:\Users\RDP"
+          $watchFolders = @(
+              "$backupRoot\Desktop",
+              "$backupRoot\Documents",
+              "$backupRoot\Downloads"
+          )
+
+          # State file so we remember the last contentId we uploaded
+          $stateFile = "C:\gofile_state.txt"
+          if (-not (Test-Path $stateFile)) { "" | Set-Content $stateFile }
+
+          function Get-GofileServer {
+              try {
+                  $r = Invoke-RestMethod -Uri "https://api.gofile.io/servers" -Method Get
+                  return $r.data.servers[0].name
+              } catch { return "store1" }
+          }
+
+          function Upload-ToGofile {
+              param([string]$zipPath)
+
+              $server = Get-GofileServer
+              $uri = "https://$server.gofile.io/contents/uploadfile"
+
+              $form = @{
+                  file = Get-Item -Path $zipPath
+              }
+              if ($token)   { $form["token"]    = $token }
+              if ($folderId){ $form["folderId"] = $folderId }
+
+              try {
+                  $resp = Invoke-RestMethod -Uri $uri -Method Post -Form $form
+                  if ($resp.status -eq "ok") {
+                      return $resp.data
+                  }
+                  Write-Host "Upload failed: $($resp.status)"
+                  return $null
+              } catch {
+                  Write-Host "Upload exception: $($_.Exception.Message)"
+                  return $null
+              }
+          }
+
+          function Delete-GofileContent {
+              param([string]$contentId)
+              if (-not $token -or -not $contentId) { return }
+              try {
+                  $body = @{
+                      contentsId = $contentId
+                      token      = $token
+                  } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.gofile.io/contents" -Method Delete -Body $body -ContentType "application/json" | Out-Null
+                  Write-Host "Old backup $contentId deleted"
+              } catch {
+                  Write-Host "Delete failed (ignored): $($_.Exception.Message)"
+              }
+          }
+
+          function Do-Backup {
+              $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+              $zip   = "C:\backup-$stamp.zip"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Starting backup → $zip"
+
+              # Build zip of the three folders (only if they exist)
+              $toZip = @()
+              foreach ($f in $watchFolders) {
+                  if (Test-Path $f) { $toZip += $f }
+              }
+              if ($toZip.Count -eq 0) {
+                  Write-Host "Nothing to backup yet"
+                  return
+              }
+
+              try {
+                  Compress-Archive -Path $toZip -DestinationPath $zip -Force -CompressionLevel Optimal
+              } catch {
+                  Write-Host "Zip failed: $($_.Exception.Message)"
+                  return
+              }
+
+              $data = Upload-ToGofile -zipPath $zip
+              Remove-Item $zip -Force -ErrorAction SilentlyContinue
+
+              if ($data) {
+                  Write-Host "Uploaded: $($data.downloadPage)  (id=$($data.fileId))"
+                  # Delete previous backup
+                  $oldId = Get-Content $stateFile -ErrorAction SilentlyContinue
+                  if ($oldId) { Delete-GofileContent -contentId $oldId }
+                  # Save new id
+                  $data.fileId | Set-Content $stateFile
+              }
+          }
+
+          # ---------- Optional Downloads.bat helper ----------
           $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
-
-          $deadline = (Get-Date).AddMinutes(8)
+          $deadline = (Get-Date).AddMinutes(4)
           while ((Get-Date) -lt $deadline) {
               if (Test-Path $rdpProfile) {
                   try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
+                      if (-not (Test-Path $startupPath)) { New-Item -ItemType Directory -Path $startupPath -Force | Out-Null }
                       Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
                       cmd /c $downloadPath
-                      Write-Host "Downloads.bat placed and run"
                       break
-                  } catch {
-                      Write-Host "Downloads.bat step skipped: $($_.Exception.Message)"
-                      break
-                  }
+                  } catch { break }
               }
-              Start-Sleep -Seconds 20
+              Start-Sleep -Seconds 12
           }
 
-          # Hold the runner open
+          # ---------- Main loop ----------
+          # First backup after ~2 hours, then every 2 hours.
+          # Final backup at ~1 h 55 min before the 6-hour mark (i.e. at minute 245).
+          $startTime     = Get-Date
+          $nextBackup    = $startTime.AddHours(2)
+          $finalBackupAt = $startTime.AddMinutes(245)   # 4 h 05 min → leaves ~1 h 55 min
+          $didFinal      = $false
+
           while ($true) {
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP live — terminate workflow to stop"
+              $now = Get-Date
+              Write-Host "[$($now.ToString('HH:mm:ss'))] RDP live – next backup $($nextBackup.ToString('HH:mm:ss'))"
+
+              if ($now -ge $nextBackup) {
+                  Do-Backup
+                  $nextBackup = $now.AddHours(2)
+              }
+
+              # Guaranteed last backup ~1 h 55 min before end
+              if (-not $didFinal -and $now -ge $finalBackupAt) {
+                  Write-Host "Final backup window reached"
+                  Do-Backup
+                  $didFinal = $true
+              }
+
               Start-Sleep -Seconds 300
           }
